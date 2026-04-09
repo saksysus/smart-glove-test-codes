@@ -1,0 +1,319 @@
+// ============================================================
+//  ISL Smart Sign Language Glove — ESP32
+//  Detects: A B C D E F | 1 2 3 4 5 | READY STOP
+//  Sensor fusion: 5x Flex + MPU6050 (pitch/roll)
+// ============================================================
+
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
+#include <math.h>
+
+// ─── Pin Definitions ────────────────────────────────────────
+#define PIN_THUMB   34
+#define PIN_INDEX   35
+#define PIN_MIDDLE  32
+#define PIN_RING    33
+#define PIN_PINKY   36
+
+// ─── Finger Index Constants ──────────────────────────────────
+#define THUMB   0
+#define INDEX   1
+#define MIDDLE  2
+#define RING    3
+#define PINKY   4
+
+// ─── Finger State Thresholds (%) ────────────────────────────
+#define STRAIGHT_MAX   30.0f
+#define HALFBENT_MIN   30.0f
+#define HALFBENT_MAX   65.0f
+#define BENT_MIN       65.0f
+
+// ─── Averaging & Debounce ───────────────────────────────────
+#define AVG_SAMPLES      10      // Readings to average per cycle
+#define DEBOUNCE_COUNT    4      // Stable frames before accepting gesture
+#define RETAIN_MS      1500      // ms to hold a confirmed gesture on LCD
+
+// ─── Hardware Objects ────────────────────────────────────────
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+Adafruit_MPU6050  mpu;
+
+// ─── Calibration Storage ────────────────────────────────────
+int   calFlat[5];   // ADC value when finger is straight
+int   calFist[5];   // ADC value when finger is fully bent
+
+// ─── Runtime State ──────────────────────────────────────────
+float    bendPct[5];            // Normalized 0–100%
+float    pitch_deg, roll_deg;   // IMU angles in degrees
+String   lastGesture      = "";
+String   confirmedGesture = "";
+int      debounceCount    = 0;
+unsigned long retainUntil = 0;
+
+// ============================================================
+//  HELPER: Read averaged ADC
+// ============================================================
+int readAveraged(int pin) {
+  long sum = 0;
+  for (int i = 0; i < AVG_SAMPLES; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(200);
+  }
+  return (int)(sum / AVG_SAMPLES);
+}
+
+// ============================================================
+//  CALIBRATION
+//  Step 1 – Flat hand (fingers straight)
+//  Step 2 – Fist (fingers fully bent)
+// ============================================================
+void calibrate() {
+  int pins[5] = { PIN_THUMB, PIN_INDEX, PIN_MIDDLE, PIN_RING, PIN_PINKY };
+
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("CALIBRATE: FLAT");
+  lcd.setCursor(0, 1); lcd.print("Press BOOT btn");
+  while (digitalRead(0) == HIGH) delay(50);   // Wait for GPIO0 (BOOT button)
+  delay(300);
+  for (int i = 0; i < 5; i++) calFlat[i] = readAveraged(pins[i]);
+
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("CALIBRATE: FIST");
+  lcd.setCursor(0, 1); lcd.print("Press BOOT btn");
+  while (digitalRead(0) == HIGH) delay(50);
+  delay(300);
+  for (int i = 0; i < 5; i++) calFist[i] = readAveraged(pins[i]);
+
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("Calibration OK!");
+  delay(1500);
+  lcd.clear();
+}
+
+// ============================================================
+//  NORMALIZE: Raw ADC → 0–100% bend
+// ============================================================
+float normalizeBend(int raw, int flatVal, int fistVal) {
+  if (fistVal == flatVal) return 0.0f;
+  float pct = 100.0f * (raw - flatVal) / (float)(fistVal - flatVal);
+  return constrain(pct, 0.0f, 100.0f);
+}
+
+// ============================================================
+//  READ SENSORS
+// ============================================================
+void readSensors() {
+  int pins[5] = { PIN_THUMB, PIN_INDEX, PIN_MIDDLE, PIN_RING, PIN_PINKY };
+  for (int i = 0; i < 5; i++) {
+    int raw = readAveraged(pins[i]);
+    bendPct[i] = normalizeBend(raw, calFlat[i], calFist[i]);
+  }
+
+  sensors_event_t a, g, temp;
+  mpu.getEvent(&a, &g, &temp);
+  float ax = a.acceleration.x;
+  float ay = a.acceleration.y;
+  float az = a.acceleration.z;
+
+  // Pitch and roll in degrees (as specified)
+  pitch_deg = atan2(ay, az) * 180.0f / PI;
+  roll_deg  = atan2(ax, az) * 180.0f / PI;
+}
+
+// ============================================================
+//  FINGER STATE HELPERS
+// ============================================================
+inline bool isS(int f)  { return bendPct[f] <= STRAIGHT_MAX; }
+inline bool isHB(int f) { return bendPct[f] > HALFBENT_MIN && bendPct[f] <= HALFBENT_MAX; }
+inline bool isB(int f)  { return bendPct[f] > BENT_MIN; }
+
+inline bool inRange(float val, float lo, float hi) {
+  return (val >= lo && val <= hi);
+}
+
+// ============================================================
+//  GESTURE CLASSIFIER
+//  Priority: READY→STOP→A→E→1→D→2→4→B→3→C→F→5
+// ============================================================
+String classifyGesture(float bp[], float pitch, float roll) {
+
+  // ── READY: All S | Pitch -40 to -70
+  if (isS(THUMB) && isS(INDEX) && isS(MIDDLE) && isS(RING) && isS(PINKY)
+      && inRange(pitch, -70.0f, -40.0f)) {
+    return "READY";
+  }
+
+  // ── STOP: All B | Roll +30 to +60
+  if (isB(THUMB) && isB(INDEX) && isB(MIDDLE) && isB(RING) && isB(PINKY)
+      && inRange(roll, 30.0f, 60.0f)) {
+    return "STOP";
+  }
+
+  // ── A: Thumb S | Others B | Roll +45 to +90
+  if (isS(THUMB) && isB(INDEX) && isB(MIDDLE) && isB(RING) && isB(PINKY)
+      && inRange(roll, 45.0f, 90.0f)) {
+    return "A";
+  }
+
+  // ── E: All B | Roll +20 to +60
+  if (isB(THUMB) && isB(INDEX) && isB(MIDDLE) && isB(RING) && isB(PINKY)
+      && inRange(roll, 20.0f, 60.0f)) {
+    return "E";
+  }
+
+  // ── 1: Index S | Others B | Thumb B | Pitch +40 to +80
+  if (isS(INDEX) && isB(THUMB) && isB(MIDDLE) && isB(RING) && isB(PINKY)
+      && inRange(pitch, 40.0f, 80.0f)) {
+    return "1";
+  }
+
+  // ── D: Index S | Others B | Thumb HB | Pitch +30 to +70
+  if (isS(INDEX) && isHB(THUMB) && isB(MIDDLE) && isB(RING) && isB(PINKY)
+      && inRange(pitch, 30.0f, 70.0f)) {
+    return "D";
+  }
+
+  // ── 2: Index S + Middle S | Others B (Thumb free)
+  if (isS(INDEX) && isS(MIDDLE) && isB(RING) && isB(PINKY)) {
+    return "2";
+  }
+
+  // ── 4: Thumb B | Others S | Pitch -10 to +15
+  if (isB(THUMB) && isS(INDEX) && isS(MIDDLE) && isS(RING) && isS(PINKY)
+      && inRange(pitch, -10.0f, 15.0f)) {
+    return "4";
+  }
+
+  // ── B: Thumb B | Others S | Pitch +10 to +40
+  if (isB(THUMB) && isS(INDEX) && isS(MIDDLE) && isS(RING) && isS(PINKY)
+      && inRange(pitch, 10.0f, 40.0f)) {
+    return "B";
+  }
+
+  // ── 3: Thumb S + Index S + Middle S | Others B
+  if (isS(THUMB) && isS(INDEX) && isS(MIDDLE) && isB(RING) && isB(PINKY)) {
+    return "3";
+  }
+
+  // ── C: All HB | Roll -60 to -90
+  if (isHB(THUMB) && isHB(INDEX) && isHB(MIDDLE) && isHB(RING) && isHB(PINKY)
+      && inRange(roll, -90.0f, -60.0f)) {
+    return "C";
+  }
+
+  // ── F: Thumb B + Index B | Others S
+  if (isB(THUMB) && isB(INDEX) && isS(MIDDLE) && isS(RING) && isS(PINKY)) {
+    return "F";
+  }
+
+  // ── 5: All S | Neutral orientation
+  if (isS(THUMB) && isS(INDEX) && isS(MIDDLE) && isS(RING) && isS(PINKY)) {
+    return "5";
+  }
+
+  return "---";
+}
+
+// ============================================================
+//  LCD DISPLAY
+// ============================================================
+void displayGesture(const String& gesture) {
+  lcd.clear();
+  if (gesture == "---") {
+    lcd.setCursor(0, 0); lcd.print("ISL Glove");
+    lcd.setCursor(0, 1); lcd.print("No gesture");
+    return;
+  }
+  lcd.setCursor(0, 0); lcd.print("Gesture:");
+  lcd.setCursor(0, 1);
+  if (gesture == "READY") { lcd.print("** READY **"); }
+  else if (gesture == "STOP") { lcd.print("** STOP  **"); }
+  else { lcd.print(">>> "); lcd.print(gesture); lcd.print(" <<<"); }
+}
+
+// ============================================================
+//  DEBOUNCE + RETAIN LOGIC
+// ============================================================
+void updateGestureDisplay(const String& raw) {
+  unsigned long now = millis();
+
+  // Retain confirmed gesture for RETAIN_MS
+  if (confirmedGesture != "" && now < retainUntil && raw == "---") {
+    return;  // Still within retain window, show last confirmed
+  }
+
+  // Debounce: require DEBOUNCE_COUNT consecutive matching frames
+  if (raw == lastGesture) {
+    debounceCount++;
+  } else {
+    debounceCount = 0;
+    lastGesture = raw;
+  }
+
+  if (debounceCount >= DEBOUNCE_COUNT) {
+    if (raw != confirmedGesture) {
+      confirmedGesture = raw;
+      retainUntil = now + RETAIN_MS;
+      displayGesture(confirmedGesture);
+    }
+    debounceCount = DEBOUNCE_COUNT;  // Clamp to prevent overflow
+  }
+}
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+  Serial.begin(115200);
+  pinMode(0, INPUT_PULLUP);  // BOOT button for calibration
+
+  Wire.begin(21, 22);  // SDA, SCL
+
+  // LCD Init
+  lcd.init();
+  lcd.backlight();
+  lcd.setCursor(0, 0); lcd.print("ISL Glove v1.0");
+  lcd.setCursor(0, 1); lcd.print("Initializing...");
+  delay(1000);
+
+  // MPU6050 Init
+  if (!mpu.begin()) {
+    lcd.clear();
+    lcd.setCursor(0, 0); lcd.print("MPU6050 FAIL!");
+    while (1) delay(100);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_2_G);
+  mpu.setGyroRange(MPU6050_RANGE_250_DEG);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  // Calibration
+  calibrate();
+
+  lcd.clear();
+  lcd.setCursor(0, 0); lcd.print("ISL Glove Ready");
+  lcd.setCursor(0, 1); lcd.print("Show a gesture!");
+  delay(1500);
+  lcd.clear();
+}
+
+// ============================================================
+//  MAIN LOOP
+// ============================================================
+void loop() {
+  readSensors();
+
+  String gesture = classifyGesture(bendPct, pitch_deg, roll_deg);
+
+  updateGestureDisplay(gesture);
+
+  // Serial debug (optional — comment out for production)
+  Serial.printf(
+    "T:%.0f I:%.0f M:%.0f R:%.0f P:%.0f | P:%.1f R:%.1f | %s\n",
+    bendPct[THUMB], bendPct[INDEX], bendPct[MIDDLE],
+    bendPct[RING], bendPct[PINKY],
+    pitch_deg, roll_deg, gesture.c_str()
+  );
+
+  delay(40);  // ~25 Hz update rate
+}
